@@ -133,11 +133,16 @@ def _build_montage_prompt(transcript: TranscriptState, request_count: int, min_d
 
 
 async def _post_openai_with_retry(payload: dict) -> dict:
-    """POST na Chat Completions API com retry-com-backoff SO para rate limit
-    (429). Contas com TPM baixo (ex: 30000) estouram em transcricoes/montagens
-    longas; um retry apos alguns segundos costuma resolver porque a janela de 1
-    minuto libera de novo. Outros erros nao sao retentados -- retry nao ajudaria."""
-    attempts, delay = 3, 6.0
+    """POST na Chat Completions API com retry-com-backoff SO para rate limit (429).
+
+    Contas com TPM baixo (ex: 30000) estouram em montagens longas; o limite e por
+    JANELA DE 1 MINUTO, entao esperas curtas (6s) morriam dentro da mesma janela e
+    o raise_for_status() vazava httpx.HTTPStatusError -- que os endpoints nao
+    capturavam e virava HTTP 500 mudo na tela do usuario. Agora: espera longa o
+    bastante pra janela virar (honra o header Retry-After quando vem), e TODA
+    falha final vira RuntimeError com mensagem em portugues que a UI exibe."""
+    attempts, delay = 3, 20.0
+    resp = None
     for attempt in range(attempts):
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(
@@ -146,13 +151,29 @@ async def _post_openai_with_retry(payload: dict) -> dict:
                 json=payload,
             )
         if resp.status_code == 429 and attempt < attempts - 1:
-            await asyncio.sleep(delay)
+            try:
+                wait = float(resp.headers.get("retry-after", delay))
+            except (TypeError, ValueError):
+                wait = delay
+            await asyncio.sleep(min(wait, 60.0))
             delay *= 2
             continue
-        resp.raise_for_status()
-        return resp.json()
-    resp.raise_for_status()  # pragma: no cover -- inalcancavel, so satisfaz o linter
-    return resp.json()  # pragma: no cover
+        break
+
+    if resp.status_code == 429:
+        raise RuntimeError(
+            "Limite de uso da conta OpenAI atingido (tokens por minuto). "
+            "Aguarde ~1 minuto e tente de novo. Se acontecer sempre, aumente o "
+            "limite da conta em platform.openai.com/account/rate-limits."
+        )
+    if resp.status_code >= 400:
+        detalhe = ""
+        try:
+            detalhe = resp.json().get("error", {}).get("message", "")[:300]
+        except Exception:  # noqa: BLE001
+            detalhe = resp.text[:300]
+        raise RuntimeError(f"IA falhou (HTTP {resp.status_code}): {detalhe}")
+    return resp.json()
 
 
 async def _call_openai_montage(transcript: TranscriptState, request_count: int, min_dur: float, max_dur: float) -> dict:

@@ -554,6 +554,10 @@ class DvMontageRequest(BaseModel):
     max_dur: float = 90.0
 
 
+# Rede de seguranca dos objetivos: QUALQUER excecao vira 502 com mensagem legivel
+# na tela + registro em errors.log. Antes so RuntimeError era capturado -- um
+# httpx.HTTPStatusError (ex: rate limit da OpenAI apos os retries) vazava e o
+# usuario via so "HTTP 500", sem saber o motivo nem o que fazer.
 @app.post("/davinci/viral")
 async def dv_viral(req: DvViralRequest | None = None):
     req = req or DvViralRequest()
@@ -563,7 +567,10 @@ async def dv_viral(req: DvViralRequest | None = None):
             transcript, min_score=req.min_score, max_clips=req.max_clips,
             min_dur=req.min_dur, max_dur=req.max_dur,
         )
-    except RuntimeError as e:
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _dv_log_error("viral", str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     for i, c in enumerate(clips):
         c.color = _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
@@ -580,7 +587,10 @@ async def dv_frankenbite(req: DvMontageRequest | None = None):
         montages, meta = await extract_montages(
             transcript, max_montages=req.n_videos, min_dur=req.min_dur, max_dur=req.max_dur,
         )
-    except RuntimeError as e:
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _dv_log_error("frankenbite", str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     # cada montagem inteira ganha 1 cor propria (video montado = 1 cor)
     for i, m in enumerate(montages):

@@ -398,11 +398,11 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   function __setSleepForTests(fn) { sleep = fn; }
 
   // Retry com backoff SO para rate limit (429) -- contas com TPM baixo (ex: 30000)
-  // estouram em transcricoes longas; um retry apos alguns segundos costuma
-  // resolver porque a janela de 1 minuto libera de novo. Nao reencaminha outros
+  // estouram em transcricoes longas. O limite e por JANELA DE 1 MINUTO: esperas
+  // curtas morriam dentro da mesma janela, por isso 20s/40s. Nao reencaminha outros
   // erros (schema invalido, chave errada etc -- esses falham na hora, retry nao ajuda).
   async function gptCallWithRetry(apiKey, systemPrompt, userPrompt, toolName, schema, logSink, temperature) {
-    var attempts = 3, delay = 6000;
+    var attempts = 3, delay = 20000;
     for (var i = 0; i < attempts; i++) {
       try {
         return await gptCall(apiKey, systemPrompt, userPrompt, toolName, schema, logSink, temperature);
