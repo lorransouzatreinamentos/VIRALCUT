@@ -37,7 +37,7 @@ def _run(coro):
 
 
 def _patch_local(monkeypatch, counter):
-    def fake(_path, _lang):
+    def fake(_path, _lang, _on_progress=None):
         counter["n"] += 1
         return _fake_transcript()
     monkeypatch.setattr(transcribe, "_local_transcribe_sync", fake)

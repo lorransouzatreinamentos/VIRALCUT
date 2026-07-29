@@ -166,27 +166,59 @@ INSTALL_HINT = (
 )
 
 
-def _local_transcribe_sync(audio_path: str, language: str) -> TranscriptState:
+def _local_transcribe_sync(audio_path: str, language: str, on_progress=None) -> TranscriptState:
     """Engine local (faster-whisper). Levanta RuntimeError com instrucao de
     conserto -- nao existe mais fallback silencioso pra nuvem (o usuario nao
-    quer pagar API nem mandar audio pra fora sem saber)."""
+    quer pagar API nem mandar audio pra fora sem saber).
+
+    on_progress(pct 0-100): chamado conforme a engine emite "PROGRESS N" no
+    stderr -- alimenta a barra de progresso da UI (antes ficava parada minutos
+    e o usuario nao sabia se estava rodando).
+    """
     if not _LOCAL_SCRIPT.exists():
         raise RuntimeError(INSTALL_HINT.format(motivo=f"script nao encontrado em {_LOCAL_SCRIPT}"))
+
+    import threading
     try:
         # sys.executable (nao "python3" fixo) -- garante o MESMO interprete que
         # esta rodando este processo (o venv onde faster-whisper foi instalado).
-        # "python3" fixo nao existiria no Windows (venv la so tem python.exe).
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, str(_LOCAL_SCRIPT), audio_path, language],
-            capture_output=True, text=True, timeout=1800,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-    except Exception as e:  # noqa: BLE001 -- timeout, interpretador quebrado
+    except Exception as e:  # noqa: BLE001 -- interpretador quebrado
         raise RuntimeError(INSTALL_HINT.format(motivo=str(e))) from e
 
-    if result.returncode != 0:
-        raise RuntimeError(INSTALL_HINT.format(motivo=(result.stderr or "").strip()[:400] or "falha na engine"))
+    # watchdog: mata o processo se passar do teto (substitui o timeout do run())
+    killer = threading.Timer(1800, proc.kill)
+    killer.start()
+
+    stderr_rest: list[str] = []
+
+    def _pump_stderr():
+        for line in proc.stderr:  # type: ignore[union-attr]
+            line = line.strip()
+            if line.startswith("PROGRESS "):
+                if on_progress:
+                    try:
+                        on_progress(float(line.split()[1]))
+                    except Exception:  # noqa: BLE001 -- callback nunca derruba a engine
+                        pass
+            elif line:
+                stderr_rest.append(line)
+
+    t = threading.Thread(target=_pump_stderr, daemon=True)
+    t.start()
+    stdout = proc.stdout.read() if proc.stdout else ""
+    proc.wait()
+    killer.cancel()
+    t.join(timeout=5)
+
+    if proc.returncode != 0:
+        motivo = "\n".join(stderr_rest)[-400:] or "falha na engine"
+        raise RuntimeError(INSTALL_HINT.format(motivo=motivo))
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(stdout)
     except json.JSONDecodeError as e:
         raise RuntimeError(INSTALL_HINT.format(motivo="saida invalida da engine local")) from e
     if "error" in data:
@@ -219,6 +251,7 @@ async def transcribe_timeline_audio(
     language: str = "pt",
     force: bool = False,
     cache_key_path: str | None = None,
+    on_progress=None,
 ) -> tuple[TranscriptState, dict]:
     """Transcreve SEMPRE local. Reusa o cache quando o arquivo-fonte e o mesmo.
 
@@ -246,7 +279,7 @@ async def transcribe_timeline_audio(
         state = await _transcribe_via_api(raw_audio_path, output_dir, language)
         engine = "api (OpenAI)"
     else:
-        state = await asyncio.to_thread(_local_transcribe_sync, raw_audio_path, language)
+        state = await asyncio.to_thread(_local_transcribe_sync, raw_audio_path, language, on_progress)
         engine = "local (faster-whisper)"
 
     cache.save(

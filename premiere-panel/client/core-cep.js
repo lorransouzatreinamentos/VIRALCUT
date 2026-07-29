@@ -223,16 +223,31 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
     return [venvPy, "python3", "python"];
   }
 
-  function runPython(exe, args) {
+  // spawn (nao execFile): streama o stderr da engine, que emite "PROGRESS N"
+  // conforme transcreve -- e o que alimenta a porcentagem na barra (antes ficava
+  // parada minutos e o usuario nao sabia se estava rodando).
+  function runPythonStream(exe, args, onProg) {
     return new Promise(function (resolve) {
-      childProcess.execFile(
-        exe, args, { timeout: 1800000, maxBuffer: 50 * 1024 * 1024 },
-        function (err, stdout) { resolve(err ? null : stdout); }
-      );
+      var p;
+      try { p = childProcess.spawn(exe, args); } catch (e) { return resolve(null); }
+      var out = "", errbuf = "";
+      var watchdog = setTimeout(function () { try { p.kill(); } catch (e) {} }, 1800000);
+      p.stdout.on("data", function (d) { out += d; });
+      p.stderr.on("data", function (d) {
+        errbuf += d;
+        var lines = errbuf.split("\n");
+        errbuf = lines.pop();
+        for (var i = 0; i < lines.length; i++) {
+          var m = /^PROGRESS (\d+(?:\.\d+)?)/.exec(lines[i].trim());
+          if (m && onProg) { try { onProg(parseFloat(m[1])); } catch (e) {} }
+        }
+      });
+      p.on("error", function () { clearTimeout(watchdog); resolve(null); });
+      p.on("close", function (code) { clearTimeout(watchdog); resolve(code === 0 ? out : null); });
     });
   }
 
-  async function transcribeLocal(audioPath, language) {
+  async function transcribeLocal(audioPath, language, onProg) {
     var script = findLocalTranscribeScript();
     if (!script) {
       throw new Error(INSTALL_HINT + "\n\n(procurei em: " + localTranscribeCandidates().join(" | ") + ")");
@@ -241,7 +256,7 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
     for (var i = 0; i < candidates.length; i++) {
       var exe = candidates[i];
       if (path.isAbsolute(exe) && !fs.existsSync(exe)) continue;
-      var out = await runPython(exe, [script, audioPath, language || "pt"]);
+      var out = await runPythonStream(exe, [script, audioPath, language || "pt"], onProg);
       if (!out) continue;
       var data;
       try { data = JSON.parse(out); } catch (e) { continue; }
@@ -252,6 +267,53 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
       return { words: words, segments: segments };
     }
     throw new Error(INSTALL_HINT);
+  }
+
+  // Confere se um interprete Python tem o faster-whisper instalado (preflight).
+  function pyImportCheck(exe) {
+    return new Promise(function (resolve) {
+      childProcess.execFile(exe, ["-c", "import faster_whisper"], { timeout: 20000 },
+        function (err) { resolve(!err); });
+    });
+  }
+
+  // Verificacao de recursos na abertura do painel: sem chave da IA ou sem
+  // faster-whisper, a UI avisa NA HORA e bloqueia o recurso afetado -- em vez
+  // de deixar rodar e falhar no meio com mensagem tecnica.
+  async function preflight() {
+    var problems = [];
+    try { readOpenAIKey(); } catch (e) {
+      problems.push({
+        id: "openai_key",
+        msg: "Chave da IA (OpenAI) não configurada — os cortes por IA não vão funcionar. " +
+             "Rode o instalador de novo e cole a chave, ou edite o arquivo .viralcut/.env " +
+             "na sua pasta de usuário (OPENAI_API_KEY=sk-...)."
+      });
+    }
+    var script = findLocalTranscribeScript();
+    if (!script) {
+      problems.push({
+        id: "whisper_script",
+        msg: "Arquivos da transcrição local não encontrados — a análise não vai rodar. " +
+             "Rode o instalador de novo (install-mac.sh / install-windows.ps1)."
+      });
+    } else {
+      var candidates = pythonCandidates();
+      var ok = false;
+      for (var i = 0; i < candidates.length && !ok; i++) {
+        var exe = candidates[i];
+        if (path.isAbsolute(exe) && !fs.existsSync(exe)) continue;
+        ok = await pyImportCheck(exe);
+      }
+      if (!ok) {
+        problems.push({
+          id: "faster_whisper",
+          msg: "Transcrição local (faster-whisper) não instalada — a análise não vai rodar. " +
+               "Rode o instalador de novo (install-mac.sh / install-windows.ps1)."
+        });
+      }
+    }
+    return { ok: !problems.length, problems: problems };
   }
 
   // ---------------------------------------------------------------------------
@@ -832,7 +894,14 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
       }
       if (!t) {
         onProgress(pct, "Transcrevendo vídeo " + (si + 1) + "/" + sources.length + "…");
-        t = await transcribeLocal(path, "pt");
+        // progresso REAL dentro do video: a engine emite PROGRESS 0-99 conforme
+        // transcreve; mapeia pra fatia deste video na barra geral (10-90%).
+        t = await transcribeLocal(path, "pt", (function (idx, total) {
+          return function (frac) {
+            var overall = 10 + Math.round(80 * (idx + Math.min(frac, 100) / 100) / total);
+            onProgress(overall, "Transcrevendo vídeo " + (idx + 1) + "/" + total + "…");
+          };
+        })(si, sources.length));
         cacheSave(path, "pt", t, engine);
       } else {
         onProgress(pct, "Vídeo " + (si + 1) + "/" + sources.length + " (cache)");
@@ -855,7 +924,7 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
     return transcript;
   }
 
-  async function viralCuts(transcript, source, opts) {
+  async function viralCuts(transcript, source, opts, onProgress) {
     opts = opts || {};
     var apiKey = readOpenAIKey();
     var minDur = opts.minDur || 30;
@@ -872,6 +941,7 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
     var allRawClips = [];
     var chunksFalhos = 0;
     for (var ci = 0; ci < chunks.length; ci++) {
+      if (onProgress) { try { onProgress(ci, chunks.length); } catch (e) {} }
       var user = buildUserPrompt(chunks[ci], minScore, maxClips, minDur, maxDur);
       try {
         var out = await gptCallWithRetry(apiKey, SYSTEM_PROMPT_VIRAL, user, "propose_clips", CLIP_SCHEMA, null, 0.1);
@@ -1123,6 +1193,7 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
     buildMontagePlan: buildMontagePlan, // materializa objetivo 2 (1 sequencia por montagem)
     logApplied: logApplied,
     updatePanel: updatePanel,
+    preflight: preflight,        // checagem de chave/recursos na abertura do painel
     // expostos para teste
     _cacheFingerprint: cacheFingerprint,
     _remapToTimeline: remapToTimeline,

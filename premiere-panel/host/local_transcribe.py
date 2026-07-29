@@ -36,13 +36,24 @@ def main():
 
     try:
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments_gen, _info = model.transcribe(
+        segments_gen, info = model.transcribe(
             audio_path, language=language, word_timestamps=True, vad_filter=True
         )
+        # Duracao total do audio -> permite emitir PROGRESSO REAL no stderr
+        # ("PROGRESS 42") conforme os segmentos vao saindo. O chamador (Python via
+        # Popen, Node via spawn) le essas linhas e atualiza a barra -- sem isso a
+        # barra ficava parada minutos e o usuario nao sabia se estava rodando.
+        total = float(getattr(info, "duration", 0) or 0)
+        last_pct = -1
 
         words = []
         segments = []
         for seg in segments_gen:
+            if total > 0:
+                pct = min(99, int(seg.end / total * 100))
+                if pct > last_pct:
+                    last_pct = pct
+                    print(f"PROGRESS {pct}", file=sys.stderr, flush=True)
             word_ids = []
             if seg.words:
                 for w in seg.words:

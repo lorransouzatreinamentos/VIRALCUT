@@ -430,41 +430,106 @@ class DvTranscribeRequest(BaseModel):
 
 @app.post("/davinci/transcribe")
 async def dv_transcribe(req: DvTranscribeRequest | None = None):
+    """Inicia a transcricao como JOB e retorna job_id. A UI faz polling em
+    /davinci/transcribe/status para mostrar PORCENTAGEM REAL -- antes a chamada
+    era sincrona e a barra ficava parada minutos sem o usuario saber se rodava."""
     if not _dv["clips"]:
         raise HTTPException(status_code=400, detail="Selecione a timeline primeiro.")
     force = bool(req and req.force)
 
-    clip_meta = _dv["clips"]
-    sources = list(dict.fromkeys(c["source_key"] for c in clip_meta))  # paths unicos, em ordem
+    sources = list(dict.fromkeys(c["source_key"] for c in _dv["clips"]))
     faltando = [p for p in sources if not os.path.exists(p)]
     if faltando:
         raise HTTPException(status_code=400, detail=f"Arquivo(s) de origem nao encontrado(s): {faltando[0]}")
 
-    # Transcreve cada ARQUIVO uma vez (cache por arquivo reaproveita entre timelines
-    # e entre execucoes). Depois remapeia tudo para tempo de timeline.
-    transcripts, any_cached, engine = {}, False, "?"
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {"status": "running", "progress": 0, "label": ""}
+    asyncio.create_task(_run_dv_transcription(job_id, force))
+    return {"job_id": job_id}
+
+
+@app.get("/davinci/transcribe/status")
+async def dv_transcribe_status(job: str):
+    st = _jobs.get(job)
+    if st is None:
+        raise HTTPException(status_code=404, detail="Job desconhecido.")
+    return st
+
+
+async def _run_dv_transcription(job_id: str, force: bool):
     try:
-        for path in sources:
-            t, meta = await transcribe_timeline_audio(path, str(TMP_DIR), language="pt", force=force)
+        clip_meta = _dv["clips"]
+        sources = list(dict.fromkeys(c["source_key"] for c in clip_meta))
+        n = len(sources)
+
+        # Transcreve cada ARQUIVO uma vez (cache por arquivo). Progresso agregado:
+        # (video_atual + fracao_do_video) / total, alimentado pelo callback que a
+        # engine local dispara via linhas "PROGRESS N".
+        transcripts, any_cached, engine = {}, False, "?"
+        for i, path in enumerate(sources):
+            _jobs[job_id]["label"] = f"Vídeo {i + 1}/{n}" if n > 1 else ""
+
+            def _cb(pct: float, _i: int = i) -> None:
+                _jobs[job_id]["progress"] = min(99, round((_i + min(pct, 100) / 100) / n * 100))
+
+            t, meta = await transcribe_timeline_audio(
+                path, str(TMP_DIR), language="pt", force=force, on_progress=_cb,
+            )
+            _jobs[job_id]["progress"] = min(99, round((i + 1) / n * 100))
             transcripts[path] = t
             any_cached = any_cached or meta.get("cached", False)
             engine = meta.get("engine", engine)
-    except Exception as e:  # noqa: BLE001
-        _dv_log_error("transcribe", str(e))
-        raise HTTPException(status_code=502, detail=f"Falha na transcricao: {e}") from e
 
-    clips = [TimelineClip(source_key=c["source_key"], ref=c["source_key"],
-                          src_in=c["src_in"], tl_start=c["tl_start"], tl_end=c["tl_end"],
-                          name=c.get("name", "")) for c in clip_meta]
-    transcript = remap_to_timeline(clips, transcripts)
-    if not transcript.segments:
-        raise HTTPException(status_code=400, detail="Nenhuma fala detectada nos videos da timeline.")
-    _dv["transcript"] = transcript
-    _dv_log()
-    return {
-        "words": len(transcript.words), "segments": len(transcript.segments),
-        "sources": len(sources), "cached": any_cached, "engine": engine,
-    }
+        clips = [TimelineClip(source_key=c["source_key"], ref=c["source_key"],
+                              src_in=c["src_in"], tl_start=c["tl_start"], tl_end=c["tl_end"],
+                              name=c.get("name", "")) for c in clip_meta]
+        transcript = remap_to_timeline(clips, transcripts)
+        if not transcript.segments:
+            _jobs[job_id] = {"status": "error", "progress": 0,
+                             "error": "Nenhuma fala detectada nos videos da timeline."}
+            return
+        _dv["transcript"] = transcript
+        _dv_log()
+        _jobs[job_id] = {
+            "status": "done", "progress": 100,
+            "words": len(transcript.words), "segments": len(transcript.segments),
+            "sources": n, "cached": any_cached, "engine": engine,
+        }
+    except Exception as e:  # noqa: BLE001 -- job assincrono: erro vira estado
+        _dv_log_error("transcribe", str(e))
+        _jobs[job_id] = {"status": "error", "progress": 0, "error": str(e)}
+
+
+_fw_available: bool | None = None  # cache do import (custa ~1s na 1a vez)
+
+
+@app.get("/preflight")
+def preflight():
+    """Verificacao de recursos na abertura do app. Sem chave da IA ou sem
+    faster-whisper, a UI avisa NA HORA e bloqueia o recurso afetado -- em vez de
+    deixar o usuario rodar e descobrir o problema por mensagem de erro no meio."""
+    global _fw_available
+    problems = []
+    if not settings.openai_api_key.startswith("sk-"):
+        problems.append({
+            "id": "openai_key",
+            "msg": ("Chave da IA (OpenAI) não configurada — os cortes por IA não vão funcionar. "
+                    "Rode o instalador de novo e cole a chave, ou edite o arquivo .viralcut/.env "
+                    "na sua pasta de usuário (OPENAI_API_KEY=sk-...)."),
+        })
+    if _fw_available is None:
+        try:
+            import faster_whisper  # noqa: F401
+            _fw_available = True
+        except ImportError:
+            _fw_available = False
+    if not _fw_available:
+        problems.append({
+            "id": "faster_whisper",
+            "msg": ("Transcrição local (faster-whisper) não instalada — a análise não vai rodar. "
+                    "Rode o instalador de novo (install-mac.sh / install-windows.ps1)."),
+        })
+    return {"ok": not problems, "problems": problems}
 
 
 def _require_transcript():

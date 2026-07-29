@@ -11,7 +11,13 @@ let currentObj = null;      // "viral" | "frankenbite" | "silence"
 let currentData = null;     // resultado do objetivo atual
 
 const $ = (id) => document.getElementById(id);
-const setP = (pct, txt) => { $("progressBar").style.width = pct + "%"; $("progressTxt").textContent = txt; };
+// Porcentagem SEMPRE visível no texto (pedido do usuário: "tá um tempão aqui e
+// não sei se tá rodando ou não") — a barra sozinha não bastava.
+const setP = (pct, txt) => {
+  $("progressBar").style.width = pct + "%";
+  const p = Math.round(pct);
+  $("progressTxt").textContent = (p > 0 && p < 100 ? `${p}% · ` : "") + txt;
+};
 const msg = (el, text, kind) => { el.innerHTML = `<div class="msg ${kind}">${text}</div>`; };
 const fmt = (sec) => { const m = Math.floor(sec / 60), s = Math.round(sec % 60); return `${m}:${String(s).padStart(2, "0")}`; };
 
@@ -56,6 +62,10 @@ $("btnSelect").onclick = async () => {
 // --- Passo 2: transcrever (uma vez; reusa cache do mesmo vídeo) ---
 // force=true: o usuário trocou/reeditou a mídia e quer refazer do zero.
 async function runTranscribe(force) {
+  // Bloqueio de preflight: sem faster-whisper a análise não roda — avisa antes.
+  const pfT = (window.__preflight?.problems || []).find((p) => p.id === "faster_whisper" || p.id === "whisper_script");
+  if (pfT) { $("progressWrap").style.display = "block"; setP(0, ""); return msg($("progressTxt"), pfT.msg, "err"); }
+
   $("btnAnalyze").disabled = true;
   $("btnRetranscribe").disabled = true;
   $("progressWrap").style.display = "block";
@@ -66,8 +76,18 @@ async function runTranscribe(force) {
       words = transcript.words.length;
       cached = transcript.__cached;
     } else {
-      setP(30, force ? "Transcrevendo de novo…" : "Transcrevendo (pode levar 1-2 min)…");
-      const r = await api("/davinci/transcribe", { method: "POST", body: { force: !!force } });
+      // Job + polling: o Core reporta a porcentagem REAL da transcrição (a engine
+      // emite progresso conforme processa) — a barra nunca mais fica parada.
+      setP(1, "Preparando…");
+      const start = await api("/davinci/transcribe", { method: "POST", body: { force: !!force } });
+      let r;
+      for (;;) {
+        await new Promise((s) => setTimeout(s, 1000));
+        r = await api("/davinci/transcribe/status?job=" + start.job_id);
+        if (r.status === "error") throw new Error(r.error || "Falha na transcrição.");
+        if (r.status === "done") break;
+        setP(r.progress || 1, (r.label ? r.label + " — " : "") + "transcrevendo no seu computador…");
+      }
       transcript = true; // no DaVinci a transcrição fica no Core; a UI só precisa saber que existe
       words = r.words;
       cached = r.cached;
@@ -147,6 +167,12 @@ function readOpts(name) {
 
 async function runObjective(name) {
   if (!transcript) return;
+  // Bloqueio de preflight: os objetivos com IA precisam da chave. Sem ela, avisa
+  // e NÃO roda (pedido do usuário) — remover silêncios é algorítmico e passa.
+  if (name !== "silence") {
+    const pfK = (window.__preflight?.problems || []).find((p) => p.id === "openai_key");
+    if (pfK) return msg($("results"), pfK.msg, "err");
+  }
   const o = readOpts(name);
   if ((name === "viral" || name === "frankenbite") && o.minDur >= o.maxDur) {
     return msg($("results"), "A duração mínima precisa ser menor que a máxima.", "err");
@@ -157,7 +183,9 @@ async function runObjective(name) {
   try {
     if (name === "viral") {
       currentData = IS_PREMIERE
-        ? await core().viralCuts(transcript, window.__seq, o)
+        ? await core().viralCuts(transcript, window.__seq, o, (i, n) => {
+            if (n > 1) $("results").innerHTML = `<div class="dim">Analisando com IA… lote ${i + 1}/${n}</div>`;
+          })
         : await api("/davinci/viral", { method: "POST", body: { min_dur: o.minDur, max_dur: o.maxDur } });
       renderClips(currentData.clips, currentData.rejected, o);
     } else if (name === "frankenbite") {
@@ -333,4 +361,16 @@ async function hostVersionWithRetry(tries) {
     try { ver = (await api("/version")).version || "dev"; } catch (e) {}
   }
   $("ver").textContent = ver;
+
+  // Preflight na abertura: sem chave da IA ou sem faster-whisper, mostra um
+  // aviso claro NA HORA (e os bloqueios em runTranscribe/runObjective impedem
+  // de rodar) — em vez do usuário descobrir por erro técnico no meio do uso.
+  try {
+    const pf = IS_PREMIERE ? await core().preflight() : await api("/preflight");
+    window.__preflight = pf;
+    if (!pf.ok) {
+      $("preflight").innerHTML = `<div class="msg err"><b>⚠ Atenção — falta configuração:</b><br>` +
+        pf.problems.map((p) => "• " + p.msg).join("<br>") + `</div>`;
+    }
+  } catch (e) { /* servidor/núcleo fora: os erros dos próprios passos já orientam */ }
 })();
