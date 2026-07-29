@@ -1037,42 +1037,79 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
     }
   }
 
-  // Arquivos gerados a cada instalacao (versao com timestamp, copia de ui/app.js).
-  // Em clones de ANTES deste fix eles ainda estao rastreados e ficaram sujos --
-  // sem descartar isso primeiro, o git pull recusa com "local changes would be
-  // overwritten". Sao 100% regeraveis pelo proprio install-premiere.sh a seguir,
-  // entao descartar e sempre seguro.
-  var GENERATED_PANEL_FILES = [
-    "premiere-panel/client/app.js", "premiere-panel/client/version.js",
-    "premiere-panel/host/version.jsx", "premiere-panel/host/bundle.jsx"
-  ];
+  // ---------------------------------------------------------------------------
+  // BOTAO ATUALIZAR — 100% Node, cross-platform (Mac E Windows).
+  // ANTES: git pull "educado" (recusava com qualquer arquivo local sujo — gerados
+  // antigos, CRLF do Windows — e o app ficava no codigo velho) + `bash
+  // install-premiere.sh` (bash nao existe no Windows: o botao nem funcionava la).
+  // AGORA: fetch + reset --hard (repo e artefato de instalacao, ninguem edita nada
+  // nele; codigo local vira SEMPRE identico ao GitHub) e a resincronizacao do
+  // painel e feita aqui mesmo em Node: re-carimba a versao, concatena o bundle
+  // ExtendScript e copia premiere-panel/ para a pasta da extensao.
+  // ---------------------------------------------------------------------------
+  function copyDirSync(src, dst) {
+    if (!fs.existsSync(dst)) fs.mkdirSync(dst, { recursive: true });
+    var entries = fs.readdirSync(src);
+    for (var i = 0; i < entries.length; i++) {
+      var s = path.join(src, entries[i]), d = path.join(dst, entries[i]);
+      var st = fs.statSync(s);
+      if (st.isDirectory()) copyDirSync(s, d);
+      else { try { fs.copyFileSync(s, d); } catch (e) { /* arquivo em uso: pega no restart */ } }
+    }
+  }
 
-  // Atualiza o painel: PUXA do git (repo em ~/viralcut, o instalador clona ali) e
-  // depois resincroniza o painel CEP com o que acabou de chegar.
-  // ANTES: so resincronizava a copia local, sem git pull, e usava caminho fixo
-  // do Mac do dono -- em qualquer outra maquina o botao nao atualizava nada.
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+  // Regenera os artefatos do painel DENTRO do repo (mesma logica do
+  // install-premiere.sh / install-windows.ps1, portada pra Node).
+  function rebuildPanelArtifacts(root) {
+    var panel = path.join(root, "premiere-panel");
+    var d = new Date();
+    var v = "V." + pad2(d.getDate()) + "." + pad2(d.getMonth() + 1) + "." +
+      String(d.getFullYear()).slice(-2) + "." + pad2(d.getHours()) + "." + pad2(d.getMinutes());
+    fs.writeFileSync(path.join(panel, "client", "version.js"), 'window.__VIRALCUT_VERSION = "' + v + '";\n', "utf8");
+    fs.writeFileSync(path.join(panel, "host", "version.jsx"), 'var VIRALCUT_BUILD = "' + v + '";\n', "utf8");
+    // bundle: json2 + version + timeline num unico arquivo (o @include do CEP nao
+    // carrega de forma confiavel — mesma razao dos instaladores)
+    var h = path.join(panel, "host");
+    var bundle = fs.readFileSync(path.join(h, "json2.jsx"), "utf8") + "\n" +
+      fs.readFileSync(path.join(h, "version.jsx"), "utf8") + "\n" +
+      fs.readFileSync(path.join(h, "timeline.jsx"), "utf8");
+    fs.writeFileSync(path.join(h, "bundle.jsx"), bundle, "utf8");
+    // app.js identico ao da UI compartilhada (fonte unica de logica)
+    fs.copyFileSync(path.join(root, "ui", "app.js"), path.join(panel, "client", "app.js"));
+    return v;
+  }
+
+  function panelInstallDir() {
+    var ext = cepExtensionPath();
+    if (ext) return ext;  // caminho oficial da extensao em execucao (infalivel)
+    return process.platform === "win32"
+      ? path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "Adobe", "CEP", "extensions", "VIRALCUT")
+      : path.join(HOME, "Library", "Application Support", "Adobe", "CEP", "extensions", "VIRALCUT");
+  }
+
   function updatePanel() {
     return new Promise(function (resolve, reject) {
       var root = findRepoRoot();
       if (!root) return reject(new Error(
         "Repositorio nao encontrado. Rode o instalador (install-mac.sh / install-windows.ps1)."
       ));
-      // best-effort: se os arquivos ja estiverem sem rastreamento (clones novos),
-      // isto so falha em silencio -- nao impede o pull.
-      childProcess.execFile("git", ["checkout", "--"].concat(GENERATED_PANEL_FILES),
-        { cwd: root, timeout: 15000 }, function () { doPull(); });
-
-      function doPull() {
-        childProcess.execFile("git", ["pull", "--ff-only"], { cwd: root, timeout: 30000 },
-          function (errPull, _out, errPullStderr) {
-            if (errPull) return reject(new Error("git pull falhou: " + (errPullStderr || errPull.message).slice(-300)));
-            var script = path.join(root, "scripts", "install-premiere.sh");
-            childProcess.execFile("bash", [script], { timeout: 60000 }, function (err, stdout, stderr) {
-              if (err) return reject(new Error("update falhou: " + (stderr || err.message).slice(-300)));
-              resolve(String(stdout).trim());
+      childProcess.execFile("git", ["fetch", "origin", "main"], { cwd: root, timeout: 30000 },
+        function (errFetch, _o, errFetchStderr) {
+          if (errFetch) return reject(new Error("sem conexão com o GitHub: " + (errFetchStderr || errFetch.message).slice(-200)));
+          childProcess.execFile("git", ["reset", "--hard", "origin/main"], { cwd: root, timeout: 15000 },
+            function (errReset, _o2, errResetStderr) {
+              if (errReset) return reject(new Error("git reset falhou: " + (errResetStderr || errReset.message).slice(-200)));
+              try {
+                var v = rebuildPanelArtifacts(root);
+                copyDirSync(path.join(root, "premiere-panel"), panelInstallDir());
+                resolve("VIRALCUT " + v + " atualizado. Feche e reabra o Premiere para carregar.");
+              } catch (e) {
+                reject(new Error("falha ao reinstalar o painel: " + e.message));
+              }
             });
-          });
-      }
+        });
     });
   }
 

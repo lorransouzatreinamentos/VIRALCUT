@@ -16,11 +16,12 @@ if not exist ".venv\Scripts\activate.bat" (
 )
 
 echo Buscando atualizacoes...
-REM Descarta os arquivos gerados (regeraveis) antes do pull -- em clones antigos
-REM eles ficam sujos e travam o git pull, deixando o app rodar o codigo velho
-REM (bug do Windows selecionando video em vez da timeline).
-git checkout -- premiere-panel/client/app.js premiere-panel/client/version.js premiere-panel/host/version.jsx premiere-panel/host/bundle.jsx 2>nul
-git pull --ff-only 2>nul
+REM UPDATE FORCADO: este repo e artefato de instalacao (ninguem edita nada nele;
+REM a chave fica em %USERPROFILE%\.viralcut\.env). O pull educado recusava
+REM atualizar com qualquer arquivo local sujo (gerados antigos, CRLF do Windows)
+REM e o app subia com o codigo velho. fetch+reset garante codigo = GitHub sempre.
+git fetch origin main 2>nul
+git reset --hard origin/main >nul 2>nul
 
 REM DaVinci Resolve scripting (Windows) - necessario para o app falar com o Resolve
 set "RESOLVE_SCRIPT_API=%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting"

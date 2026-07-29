@@ -102,18 +102,29 @@ def version():
 
 @app.post("/update")
 def update():
-    """Auto-update do app DaVinci: git pull. Com uvicorn --reload, o servidor
-    recarrega o código sozinho; o browser dá reload e pega a versão nova."""
+    """Auto-update do app DaVinci: fetch + reset --hard. O repo na maquina do
+    usuario e artefato de instalacao (ninguem edita nada nele) -- o pull educado
+    recusava atualizar com qualquer arquivo local sujo (gerados antigos, CRLF do
+    Windows) e o app ficava no codigo velho. O reset garante codigo local SEMPRE
+    identico ao GitHub. Com uvicorn --reload, o servidor recarrega sozinho."""
     import subprocess
     try:
-        out = subprocess.run(
-            ["git", "pull", "--ff-only"], capture_output=True, text=True,
+        fetch = subprocess.run(
+            ["git", "fetch", "origin", "main"], capture_output=True, text=True,
             cwd=str(_REPO_ROOT), timeout=60,
         )
+        if fetch.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"sem conexao com o GitHub: {fetch.stderr[-300:]}")
+        out = subprocess.run(
+            ["git", "reset", "--hard", "origin/main"], capture_output=True, text=True,
+            cwd=str(_REPO_ROOT), timeout=30,
+        )
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"git pull falhou: {e}") from e
+        raise HTTPException(status_code=500, detail=f"update falhou: {e}") from e
     if out.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"git pull falhou: {out.stderr[-300:]}")
+        raise HTTPException(status_code=500, detail=f"git reset falhou: {out.stderr[-300:]}")
     return {"ok": True, "output": out.stdout.strip(), "version": _git_version()}
 
 

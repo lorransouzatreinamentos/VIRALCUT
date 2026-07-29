@@ -84,10 +84,14 @@ fi
 # --- 4. Codigo ----------------------------------------------------------------
 bold "4/7  Codigo do VIRALCUT"
 if [ -d "$DEST/.git" ]; then
-  git -C "$DEST" pull --ff-only >/dev/null 2>&1 || warn "nao consegui atualizar (mudancas locais?) — seguindo com a versao atual"
+  # UPDATE FORCADO: repo de instalacao, ninguem edita nada nele. fetch+reset
+  # garante codigo identico ao GitHub nao importa o estado local (o pull educado
+  # recusava com qualquer arquivo sujo e deixava rodar codigo velho).
+  git -C "$DEST" fetch origin main >/dev/null 2>&1 || warn "sem internet? seguindo com a versao local"
+  git -C "$DEST" reset --hard origin/main >/dev/null 2>&1 || true
   ok "atualizado em $DEST"
 else
-  # clone completo (nao --depth 1): o auto-update do launcher usa `git pull`
+  # clone completo (nao --depth 1): o auto-update do launcher usa fetch+reset
   git clone "$REPO" "$DEST" >/dev/null 2>&1 || die "falha ao clonar $REPO"
   ok "clonado em $DEST"
 fi
@@ -152,10 +156,12 @@ cat > "$DEST/viralcut.command" <<LAUNCHER
 #!/usr/bin/env bash
 # VIRALCUT — launcher (macOS). Atualiza, sobe o servidor local e abre o app.
 cd "\$(dirname "\$0")"
-# Descarta os arquivos gerados (regeraveis) antes do pull -- em clones antigos eles
-# ficam sujos e travam o git pull, deixando o app rodar o codigo velho.
-git checkout -- premiere-panel/client/app.js premiere-panel/client/version.js premiere-panel/host/version.jsx premiere-panel/host/bundle.jsx >/dev/null 2>&1 || true
-git pull --ff-only >/dev/null 2>&1 || true
+# UPDATE FORCADO: este repo e artefato de instalacao (ninguem edita nada nele; a
+# chave fica em ~/.viralcut/.env). O pull educado recusava atualizar com qualquer
+# arquivo local sujo e o app subia com codigo velho. fetch+reset = codigo sempre
+# identico ao GitHub. (Ignorados como .venv nao sao tocados.)
+git fetch origin main >/dev/null 2>&1 || true
+git reset --hard origin/main >/dev/null 2>&1 || true
 
 export RESOLVE_SCRIPT_API="$RS_API"
 export RESOLVE_SCRIPT_LIB="$RS_LIB"
