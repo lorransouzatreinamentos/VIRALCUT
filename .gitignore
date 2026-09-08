@@ -15,3 +15,5 @@ premiere-panel/client/app.js
 premiere-panel/client/version.js
 premiere-panel/host/version.jsx
 premiere-panel/host/bundle.jsx
+
+.DS_Store
